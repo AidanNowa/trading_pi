@@ -10,6 +10,7 @@ from datetime import datetime
 import time
 import argparse
 
+
 load_dotenv()
 api = tradeapi.REST(
     os.getenv('APCA_API_KEY_ID'),
@@ -79,6 +80,27 @@ def cancel_open_orders(symbol):
 def round_qty(qty):
     # Simple round down to 3 decimals to be safe for fractional shares
     return max(0.0, float(np.floor(qty * 1000) / 1000.0))
+
+def _ensure_single_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure we have a single-symbol, flat-column OHLCV DataFrame.
+    If a multi-ticker DataFrame sneaks in, raise a clear error.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("Expected single-symbol DataFrame with columns Open/High/Low/Close/Volume.")
+    # Normalize capitalization just in case ("close" -> "Close")
+    cols = {c: c.title() for c in df.columns}
+    return df.rename(columns=cols)
+
+def _scalar(x):
+    """Return a Python scalar from Series/ndarray/scalar without FutureWarnings."""
+    if hasattr(x, "iloc"):
+        # 1-element Series
+        return x.iloc[0]
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return np.asarray(x).ravel()[0]
+    return x
+
 
 # ---------- live signal → order logic ----------
 
@@ -186,7 +208,114 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
         else:
             logging.info(f"{symbol}: Exit signal but no position to close.")
 
-# ---------- Backtest Logic ----------
+# ---------- Backtest and Strategy Helpers ----------
+
+def ta_rsi(close: pd.Series, length=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / (avg_loss + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def ta_atr(high: pd.Series, low: pd.Series, close: pd.Series, length=14):
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    return atr
+
+
+# ---------- Backtest and Strategy Logic ----------
+
+#Faster EMA Crossover (with optional RSI filter) (much more acitve than orignal EMA
+def signals_ema_cross(df, fast=8, slow=21, use_rsi=False, rsi_th=55):
+    df = df.copy()
+    df["EMA_fast"] = df["Close"].ewm(span=fast, adjust=False).mean()
+    df["EMA_slow"] = df["Close"].ewm(span=slow, adjust=False).mean()
+    df["Signal"] = 0
+    cross_up   = (df["EMA_fast"] > df["EMA_slow"]) & (df["EMA_fast"].shift(1) <= df["EMA_slow"].shift(1))
+    cross_down = (df["EMA_fast"] < df["EMA_slow"]) & (df["EMA_fast"].shift(1) >= df["EMA_slow"].shift(1))
+    if use_rsi:
+        rsi = ta_rsi(df["Close"], length=14)
+        cross_up &= (rsi < rsi_th)  # e.g., buy when momentum resumes but not overbought
+    df.loc[cross_up, "Signal"] = 1
+    df.loc[cross_down, "Signal"] = -1
+    return df
+
+#MACD line cross (very common and moderately active)
+def signals_macd(df, fast=12, slow=26, signal_len=9):
+    df = df.copy()
+    df = df.xs(symbol, axis=1, level='Ticker')
+    ema_fast = df["Close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = df["Close"].ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal_len, adjust=False).mean()
+    df["Signal"] = 0
+    df.loc[(macd > macd_signal) & (macd.shift(1) <= macd_signal.shift(1)), "Signal"] = 1
+    df.loc[(macd < macd_signal) & (macd.shift(1) >= macd_signal.shift(1)), "Signal"] = -1
+    return df
+
+#Bollinger mean-reversion ("bounce" is very active, "breakout"is trend-following)
+def signals_bollinger(symbol, df, length=20, mult=2.0, mode="bounce"):
+    df = df.copy()
+    df = df.xs(symbol, axis=1, level='Ticker')
+    ma = df["Close"].rolling(length).mean()
+    sd = df["Close"].rolling(length).std(ddof=0)
+    upper = ma + mult * sd
+    lower = ma - mult * sd
+    df["Signal"] = 0
+
+    if mode == "bounce":
+        # contrarian: buy near lower band, sell near upper band
+        buy  = (df["Close"] < lower) & (df["Close"].shift(1) >= lower.shift(1))
+        sell = (df["Close"] > upper) & (df["Close"].shift(1) <= upper.shift(1))
+    else:  # "breakout"
+        buy  = (df["Close"] > upper) & (df["Close"].shift(1) <= upper.shift(1))
+        sell = (df["Close"] < lower) & (df["Close"].shift(1) >= lower.shift(1))
+
+    df.loc[buy, "Signal"] = 1
+    df.loc[sell, "Signal"] = -1
+    return df
+
+#Donchain breakout + ATR filer (fires on highest-N/lowest-N breakouts, ATR to reduce chop)
+def signals_donchian_atr(symbol, df, ch_len=20, atr_len=14, atr_min_mult=0.5):
+    df = df.copy()
+    df = df.xs(symbol, axis=1, level='Ticker')
+    don_high = df["High"].rolling(ch_len).max()
+    don_low  = df["Low"].rolling(ch_len).min()
+    atr = ta_atr(df["High"], df["Low"], df["Close"], length=atr_len)
+    atr_ok = atr > (atr.rolling(atr_len).mean() * atr_min_mult)
+
+    df["Signal"] = 0
+    buy  = (df["Close"] > don_high.shift(1)) & atr_ok
+    sell = (df["Close"] < don_low.shift(1))  & atr_ok
+    df.loc[buy, "Signal"] = 1
+    df.loc[sell, "Signal"] = -1
+    return df
+
+#Stochastic RSI cross (very active, will generate lots of trades)
+def signals_stoch_rsi(symbol, df, rsi_len=14, stoch_len=14, k=3, d=3, buy_th=0.2, sell_th=0.8):
+    df = df.copy()
+    df = df.xs(symbol, axis=1, level='Ticker')
+    #print(df.head())
+    rsi = ta_rsi(df["Close"], rsi_len)
+    min_rsi = rsi.rolling(stoch_len).min()
+    max_rsi = rsi.rolling(stoch_len).max()
+    stoch = (rsi - min_rsi) / (max_rsi - min_rsi + 1e-9)
+    k_ = stoch.rolling(k).mean()
+    d_ = k_.rolling(d).mean()
+
+    df["Signal"] = 0
+    buy  = (k_.shift(1) < buy_th)  & (k_ > buy_th)  & (k_ > d_)
+    sell = (k_.shift(1) > sell_th) & (k_ < sell_th) & (k_ < d_)
+    df.loc[buy, "Signal"] = 1
+    df.loc[sell, "Signal"] = -1
+    return df
 
 def moving_average_strategy(data):
     #SMA is 'Simple Moving Average' - calculate two of them and binary indicator (Signal) when 50-day SMA
@@ -227,6 +356,7 @@ def generate_signals(data):
         .fillna(0)
         .astype(int)
     )
+    #print(data[['EMA_12','EMA_26','RSI','Signal']].tail(20))
     return data
 
 def backtest(data, initial_balance=10000):
@@ -259,7 +389,7 @@ def backtest(data, initial_balance=10000):
         except Exception:
             sig = 0
 
-        price = float(row['Close'].iloc[0]) #float(row['Close'])
+        price = float(row['Close']) #float(row['Close'].iloc[0]) #float(row['Close'])
 
         if sig == 1 and balance > 0:
             position = balance / price
@@ -308,9 +438,20 @@ if __name__ == "__main__":
     # Backtest each ticker over last ~year for quick sanity check
     for symbol in tickers:
         data = yf.download(symbol, start="2024-10-22", end="2025-10-21", auto_adjust=True, progress=False)
-        data = calculate_indicators(data)
-        data = generate_signals(data)
+        #data = calculate_indicators(data)
+        #data = generate_signals(data)
+
+        # choose ONE:
+        #data = signals_ema_cross(data, fast=8, slow=21, use_rsi=False)     # very active
+       # data = signals_macd(symbol, data)                                          # moderate
+        #data = signals_bollinger(symbol, data, mode="bounce")                      # contrarian
+        #data = signals_bollinger(symbol, data, mode="breakout")                    # trend
+        #data = signals_donchian_atr(symbol, data)                                  # trend + atr
+        data = signals_stoch_rsi(symbol, data)                                     # very active
+
+        #clean dup columns just in case they exist
         data = data.loc[:, ~data.columns.duplicated()]
+        #print(data[['Signal']].tail(20))
         final_balance, buy_count, sell_count, stop_loss_count, take_profit_count = backtest(data)
         print(f"Backtest {symbol}: ${final_balance:.2f} | BUYs:{buy_count} SELLs:{sell_count} SL:{stop_loss_count} TP:{take_profit_count}")
 
