@@ -146,6 +146,7 @@ def place_bracket_order(symbol, side, qty, entry_price, tp_pct, sl_pct):
             take_profit={"limit_price": str(tp_price)},
             stop_loss={"stop_price": str(sl_price)}
         )
+        logging.info(f"{symbol}: Order submitted successfully (id={order.id})")
         return order
     except Exception as e:
         logging.exception(f"submit_order failed for {symbol}: {e}")
@@ -157,10 +158,12 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
     - 0 -> +1 : enter long (if flat)
     - +1 -> -1 : exit any long (market sell + cancel remaining OCO legs)
     """
+    print(f"Entered maybe_trade_symbol for {symbol}")
     # You can switch to Alpaca market data if you have it; for now, use yfinance:
     # Use enough history to compute indicators robustly
     lookback_start = (pd.Timestamp.today(tz="UTC") - pd.Timedelta(days=400)).date().isoformat()
-    df = yf.download(symbol, start=lookback_start, end=None, auto_adjust=True, progress=False)
+    #df = yf.download(symbol, start=lookback_start, end=None, auto_adjust=True, progress=False)
+    df = yf.download(symbol, period="5d", interval="15m", auto_adjust=True, progress=False)
     sig_row = compute_last_signal_row(df)
     if not sig_row:
         logging.info(f"{symbol}: not enough data to compute signal.")
@@ -168,7 +171,7 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
 
     prev_sig, last_sig, last_close, last_idx = sig_row
     logging.info(f"{symbol} last bar {last_idx}: prev_sig={prev_sig}, last_sig={last_sig}, close={last_close}")
-
+    print(f"{symbol} last bar {last_idx}: prev_sig={prev_sig}, last_sig={last_sig}, close={last_close}")
     qty_held = current_position_qty(symbol)
 
     # Determine risk-based quantity
@@ -176,6 +179,8 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
     risk_pct = float(os.getenv("RISK_PCT", "0.01"))   # risk 1% of cash per trade
     sl_pct   = float(os.getenv("SL_PCT", "0.05"))     # stop 5% below
     tp_pct   = float(os.getenv("TP_PCT", "0.10"))     # take profit 10% above
+
+    logging.info(f"cash ({cash}) acquired and environment variables passed")
 
     # Risk model: if SL is 5%, size so that a stop-out loses ~1% of cash.
     # risk_amount = cash * risk_pct = qty * entry_price * sl_pct => qty = risk_amount/(entry_price * sl_pct)
@@ -188,13 +193,22 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
     # Transitions
     entered_long = (prev_sig <= 0 and last_sig == 1)
     exit_long    = (prev_sig >= 0 and last_sig == -1)
-
+    logging.info(f"entered_long is {entered_long} and exit_long is {exit_long}")
+    #print(f"entered_long is {entered_long} and exit_long is {exit_long}")
     if entered_long:
         if qty_held > 0:
             logging.info(f"{symbol}: Long signal but already holding {qty_held}. Skipping new buy.")
             return
+
+        logging.info(
+            f"{symbol}: BUY signal detected "
+            f"(prev_sig={prev_sig}, last_sig={last_sig}) "
+            f"@ {last_close:.2f}, qty={qty:.4f}, tp={tp_pct*100:.1f}%, sl={sl_pct*100:.1f}%"
+        )
+
         # cancel any stale open orders just in case
         cancel_open_orders(symbol)
+        logging.info("Calling (place_bracket_order)")
         place_bracket_order(symbol, "buy", qty, last_close, tp_pct, sl_pct)
 
     elif exit_long:
@@ -202,6 +216,7 @@ def maybe_trade_symbol(symbol, timeframe="1Day"):
             logging.info(f"{symbol}: Exit signal; selling {qty_held} to flatten.")
             cancel_open_orders(symbol)
             try:
+                logging.info("Submitting flattened sell order")
                 api.submit_order(symbol=symbol, qty=str(round_qty(qty_held)), side="sell", type="market", time_in_force="day")
             except Exception as e:
                 logging.exception(f"Exit sell failed for {symbol}: {e}")
@@ -435,9 +450,29 @@ if __name__ == "__main__":
     args = parse_args()
     tickers = [t.upper() for t in args.tickers if t and not t.startswith("-")]
 
+
+    # === manual test order (fires once) ===
+    #if os.getenv("TRADE_MODE", "").lower() == "paper":
+    #    symbol = "AMZN"     # <-- pick any symbol
+    #    qty = 1             # number of shares (or fractionals allowed)
+    #    try:
+    #        print(f"Submitting TEST BUY for {symbol}")
+    #        order = api.submit_order(
+    #            symbol=symbol,
+    #            qty=str(qty),
+    #            side="buy",
+    #            type="market",
+    #            time_in_force="day"
+    #        )
+    #        print("Order submitted:", order.id)
+    #    except Exception as e:
+    #        print("Test order failed:", e)
+    # === end manual test ===
+
     # Backtest each ticker over last ~year for quick sanity check
     for symbol in tickers:
-        data = yf.download(symbol, start="2024-10-22", end="2025-10-21", auto_adjust=True, progress=False)
+        #data = yf.download(symbol, start="2024-10-22", end="2025-10-21", auto_adjust=True, progress=False)
+        data = yf.download(symbol, period="5d", interval="15m", auto_adjust=True, progress=False)
         #data = calculate_indicators(data)
         #data = generate_signals(data)
 
@@ -452,8 +487,8 @@ if __name__ == "__main__":
         #clean dup columns just in case they exist
         data = data.loc[:, ~data.columns.duplicated()]
         #print(data[['Signal']].tail(20))
-        final_balance, buy_count, sell_count, stop_loss_count, take_profit_count = backtest(data)
-        print(f"Backtest {symbol}: ${final_balance:.2f} | BUYs:{buy_count} SELLs:{sell_count} SL:{stop_loss_count} TP:{take_profit_count}")
+        #final_balance, buy_count, sell_count, stop_loss_count, take_profit_count = backtest(data)
+        #print(f"Backtest {symbol}: ${final_balance:.2f} | BUYs:{buy_count} SELLs:{sell_count} SL:{stop_loss_count} TP:{take_profit_count}")
 
     # Optional live trading pass (single-shot). For a daemonized loop, see below.
     if args.live and ok_to_trade():
